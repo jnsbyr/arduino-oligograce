@@ -1,0 +1,7 @@
+{
+    "board": "arduino:avr:nano",
+    "configuration": "cpu=oligo",
+    "port": "COM3",
+    "sketch": "OligoGracePendant.ino",
+    "output": "build"
+}
