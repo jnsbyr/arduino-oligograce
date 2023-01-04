@@ -5,9 +5,10 @@
     },
     "arduino_sketch": "OligoGracePendant.ino",
     "arduino_fqbn": "arduino:avr:nano:cpu=oligo",
-    "_arduino_fqbn": "SparkFun:avr:promicro:cpu=16MHzatmega32U4",
+    "_arduino_fqbn": "arduino:avr:nano:cpu=atmega328",
     "arduino_build_properties": "",
     "_arduino_build_properties": "--build-property build.extra_flags=-DF_CPU=8000000L",
+    "arduino_upload_properties": "-v -P arduinoasisp",
+    "_arduino_upload_properties": "-v",
     "arduino_port": "COM3",
-    "arduino_upload_properties": "-v -P arduinoasisp"
 }

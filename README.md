@@ -53,7 +53,7 @@ For uploading the firmware you need the following components:
 - ATmega ISP, e.g. Arduino as ISP incl. USB/TTL adapter
 - Molex Pico-EZmate connector to attach ISP to Oligo board, e.g. part no. 369200606
 
-I placed an Arduino Pro Mini 5V on a breadboard, added 2 LEDs to D8 and D9 for monitoring the ISP status, soldered a pin header to one end of the Molex cable, connected it to D10 to D13 and uploaded the Arduino example project "ArduinoISP" after commenting in "#define USE_OLD_STYLE_WIRING". Do not connect the 5 V of the ISP to the 5 V of the Oligo board.
+I placed an Arduino Pro Mini 5V on a breadboard, added 2 LEDs to D8 and D9 for monitoring the ISP status, soldered a pin header to one end of the Molex cable, connected the pin header to D10 to D13 and uploaded the Arduino example project "ArduinoISP" after commenting in "#define USE_OLD_STYLE_WIRING". Do not connect the 5 V of the ISP to the 5 V of the Oligo board.
 
 When the LED connected to D9 of the ISP is slowly fading in and out, the ISP is ready. If you have reached this point I recommend to disconnect DTR between the USB/TTL converter and the ISP to avoid accidentally flashing the ISP instead of the Oligo ATmega328P.
 

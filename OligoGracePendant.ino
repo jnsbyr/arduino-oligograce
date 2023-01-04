@@ -31,13 +31,18 @@
  * customized firmware for Oligo Grace LED Pendant with proximity sensor (model G42-931)
  *
  * - created to fix settings persistence and startup failure
+ *
  * - provides most features of the original:
  *   - light on on power on
  *   - proximity < 600 ms: on/off
  *   - proximity > 800 ms: dim up/down
  *   - dim limit reached: 2 short blinks
  *   - dim hold > 5 s: toggle dim mode continuous/3 steps (3 longs blinks)
- *   - limit brightness to minimum when board temperature exceeds 85 °C
+ *   - limit brightness to minimum when board temperature exceeds 85 °C and
+ *     resumes normal operation after 5°C cool down
+ *
+ * - additional features:
+ *   - hold > 15s at power up: toggle proximity sensor lock (3 longs blinks)
  *
  * ****************************************************************************
  *
@@ -83,39 +88,30 @@
  * - vscode: manually add "__AVR_ATmega328P__" to c_cpp_properties.json
  *
  *
- * Things required to upload firmware:
+ * Components required to upload firmware:
  *
  * - Molex Pico-EZmate connector to attach ISP to Oligo board, e.g. part no. 369200606
  * - ATmega ISP, e.g. Arduino as ISP incl. USB/TTL adapter
  *
  *****************************************************************************
  *
- * prototype developed on: Sparkfun Pro Micro
- *
- * - vscode: manually add "__AVR_ATmega32U4__" to c_cpp_properties.json
- *
- *****************************************************************************
- *
  * possible additional features:
- * - smoother continuous dim
- * - board over temperature hysteresis
  * - fade on/off
- * - reduce IO clock to 4 MHz
+ * - separate setting for top and bottom panel
  * - 5 short blinks when board over temperature is detected for the 1st time
- * - hold > 15s at power up to enable/disable proximity sensor
  * - sync setting of 2 pendants
  * - change setting over air (WiFi/Bluetooth)
  *
  *****************************************************************************/
 
-#define VERSION "1.0.0.0" // 01.01.2023
+#define VERSION "1.0.1.0" // 03.01.2023
 
-// Arduino includes, LGPL licence
+// Arduino includes, LGPL license
 #include <EEPROM.h>
 #include <HardwareSerial.h>
 #include <wiring_private.h>
 
-// AVR includes, modified BSD licence
+// AVR includes, modified BSD license
 #include <avr/io.h>
 #include <avr/sfr_defs.h>
 #include <avr/wdt.h>
@@ -150,26 +146,30 @@
 #define DURATION_POWER_MAX       600 // [ms]
 #define DURATION_DIM_MIN         800 // [ms]
 #define DURATION_TOGGLE_STEP    5000 // [ms]
-#define DURATION_DIM_STEP_SMALL   80 // [ms]
+#define DURATION_LOCK          15000 // [ms]
+#define DURATION_DIM_STEP_SMALL   50 // [ms]
 #define DURATION_DIM_STEP_BIG   DURATION_DIM_MIN // [ms]
 
 // brightness parameters
 #define BRIGHTNESS_BIG_STEPS    3 // number of dim steps between min and max
 #define BRIGHTNESS_MIN          4 // [%]
 #define BRIGHTNESS_MAX         85 // [%]
-#define BRIGHTNESS_STEP_SMALL   2 // [%]
+#define BRIGHTNESS_STEP_SMALL   1 // [%]
 #define BRIGHTNESS_STEP_BIG   ((BRIGHTNESS_MAX - BRIGHTNESS_MIN)/BRIGHTNESS_BIG_STEPS) // [%]
 #define BRIGHTNESS_DEFAULT    (BRIGHTNESS_MAX - BRIGHTNESS_STEP_BIG) // [%], step 2/3
 
+// blink timing
 #define BLINK_PERIOD_FAST  50 // [ms]
 #define BLINK_PERIOD_SLOW 800 // [ms]
 
 // board temperature parameters
-#define NTC_TEMPERATURE_MAX      85 // [°C]
+#define NTC_TEMP_MAX             85 // [°C]
+#define NTC_TEMP_HYSTERESIS       5 // [°C]
+#define NTC_TEMP_INVALID     999.0f // [°C]
 #define DIVIDER_RESISTANCE    47000 // [Ohm]
 #define NTC_RESISTANCE     47000.0f // [Ohm]
 #define NTC_TEMP_NOM          25.0f // [°C]
-#define NTC_B_COEFFICIENT   4131.0f // B constant for 25-100°C
+#define NTC_B_COEFFICIENT   4131.0f // NTC B coefficient for 25-100°C
 #define KELVIN_CELSIUS      273.15f // [°C]
 
 
@@ -179,6 +179,7 @@ struct Settings
   int magic = EEPROM_MAGIC;
   int brightness = BRIGHTNESS_DEFAULT; // [%]
   bool dimBigSteps = true;
+  volatile bool proximitySensorLocked = false;
   uint16_t crc = 0;
 };
 Settings settings;
@@ -191,6 +192,8 @@ volatile bool initalApproach = false;
 volatile bool outputEnabled = false;
 
 bool dimUp = true;
+bool overTemperature = true;
+bool proximityAtStartup = false;
 unsigned long settingsModified = 0;
 unsigned long blinkToggled = 0;
 int blinkBrightness = 0;
@@ -252,12 +255,12 @@ template<typename T> uint16_t calculateCRC16(T& t)
 /**
  * get NTC temperature
  *
- * @return temperature [°C] or 999.0f on error
+ * @return temperature [°C] or NTC_TEMP_INVALID on error
  */
 int getNtcTemperature()
 {
   // sample input 3 times
-  size_t count = 3;
+  size_t count = 3; // will take less than 750 µs
   unsigned long sum = 0;
   for (size_t i=0; i<count; i++)
   {
@@ -266,7 +269,7 @@ int getNtcTemperature()
   }
 
   // calculate temperature
-  float temperature = 999.0f; // invalid
+  float temperature = NTC_TEMP_INVALID;
   if (sum > count*adcResolution/3)
   {
     float relation = (float)adcResolution*count/(float)sum;
@@ -302,27 +305,34 @@ void proximity()
   noInterrupts();
 
   near = digitalRead(PIN_PROXIMITY);
-  unsigned int now = millis();
-  if (near)
+
+  if (!settings.proximitySensorLocked)
   {
-    // proximity start
-    approach = now;
-    initalApproach = true;
-    if (outputEnabled && blinkToggleCount < 0)
+    unsigned int now = millis();
+    if (near)
     {
-      setMode(MODE_DEFAULT);
-    }
-  }
-  else
-  {
-    unsigned int duration = now - approach;
-    if (initalApproach && duration >= DURATION_MIN && duration <= DURATION_POWER_MAX)
-    {
-      // short proximity pulse: toggle power
-      outputEnabled = !outputEnabled;
-      if (outputEnabled)
+      // proximity start
+      approach = now;
+      initalApproach = true;
+      proximityAtStartup = false;
+      if (outputEnabled && blinkToggleCount < 0)
       {
+        // was blinking, set default mode
         setMode(MODE_DEFAULT);
+      }
+    }
+    else
+    {
+      unsigned int duration = now - approach;
+      if (initalApproach && duration >= DURATION_MIN && duration <= DURATION_POWER_MAX)
+      {
+        // short proximity pulse: toggle power
+        outputEnabled = !outputEnabled;
+        if (outputEnabled)
+        {
+          // was off, set default mode
+          setMode(MODE_DEFAULT);
+        }
       }
     }
   }
@@ -335,7 +345,7 @@ void proximity()
  */
 void setup()
 {
-  // @todo change I/O clock to 4 MHz (8 MHz / 2) currently disabled: messes with millis()
+  // @todo change I/O clock to 4 MHz (8 MHz / 2): reduces PWM duty cycle resolution and messes with millis()
   //noInterrupts();
   //CLKPR = _BV(CLKPCE);
   //CLKPR = _BV(CLKPS0);
@@ -358,11 +368,11 @@ void setup()
   TCCR1A = 0;
   TCCR1B = 0;
   TCNT1 = 0;
-  ICR1 = F_CPU/40000 - 1;  // 40 kHz (so that you can't hear the LEDs)
-  OCR1A = ICR1; // 100 % (off, inverted)
-  OCR1B = ICR1; // 100 % (off, inverted)
-  TCCR1A = _BV(COM1A1) | _BV(COM1B1) | _BV(WGM11); // clear output on match
-  TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10);    // fast PWM with TOP=ICR1 (mode 14)
+  ICR1 = F_CPU/40000; // 40 kHz PWM (so that you can't hear the LEDs)
+  OCR1A = 0;
+  OCR1B = 0;
+  TCCR1A = _BV(COM1A1) | _BV(COM1A0) |_BV(COM1B1) |_BV(COM1B0) | _BV(WGM11); // set output on match (inverted)
+  TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10); // fast PWM with TOP=ICR1 (mode 14)
 
   // configure ADC
   analogReference(DEFAULT); // ATmega328: via AVCC pin
@@ -373,15 +383,25 @@ void setup()
   EEPROM.get(EEPROM_ADDRESS, restoredSettings);
   if (restoredSettings.magic == EEPROM_MAGIC)
   {
-    // magic match
+    // magic number matches
     uint16_t eepromCRC = restoredSettings.crc;
     restoredSettings.crc = 0;
     uint16_t expectedCRC = calculateCRC16(restoredSettings);
     if (eepromCRC == expectedCRC)
     {
-      // CRC match, restore
+      // CRC matches, restore settings
       settings = restoredSettings;
       printlnDebug("settings restored from EEPROM");
+
+      // check settings
+      if (settings.brightness < BRIGHTNESS_MIN)
+      {
+        settings.brightness = BRIGHTNESS_MIN;
+      }
+      else if (settings.brightness > BRIGHTNESS_MAX)
+      {
+        settings.brightness = BRIGHTNESS_MAX;
+      }
     }
   }
 
@@ -398,6 +418,14 @@ void setup()
   }
   initalApproach = false;
 
+  // get initial proximity sensor state
+  near = digitalRead(PIN_PROXIMITY);
+  if (near)
+  {
+    approach = millis();
+    proximityAtStartup = true;
+  }
+
   // enable watchdog
   wdt_enable(WDTO_2S);
 
@@ -405,7 +433,7 @@ void setup()
 }
 
 /**
- * Arduino main loop
+ * Arduino main loop (~10 ms)
  */
 void loop()
 {
@@ -418,17 +446,30 @@ void loop()
   printDebug(near);
   printDebug(" initial:");
   printDebug(initalApproach);
-   */
+  */
 
   // feed watchdog
   wdt_reset();
 
-  delay(10);
+  delay(9);
 
-  // get board temperature
+  // check board temperature
   int ntcTemperature = getNtcTemperature();
+  if (ntcTemperature >= NTC_TEMP_MAX)
+  {
+    overTemperature = true;
+  }
+  else if (ntcTemperature < NTC_TEMP_MAX - NTC_TEMP_HYSTERESIS)
+  {
+    overTemperature = false;
+  }
+
+  /* extra debug
   printDebug("temp:");
   printlnDebug(ntcTemperature);
+  */
+
+  // test: overTemperature = false;
 
   // check proximity to dim brightness and to toggle dim direction
   unsigned int now = millis();
@@ -437,7 +478,18 @@ void loop()
     unsigned int duration = now - approach;
     if (duration >= DURATION_DIM_MIN)
     {
-      if (initalApproach)
+      if (proximityAtStartup)
+      {
+        if (duration >= DURATION_LOCK)
+        {
+          // startup proximity, toggle proximity sensor lock
+          settings.proximitySensorLocked = !settings.proximitySensorLocked;
+          settingsModified = now;
+          proximityAtStartup = false;
+          setMode(MODE_BLINK_SLOW);
+        }
+      }
+      else if (initalApproach)
       {
         // inital proximity, change dimmer direction
         dimUp = !dimUp;
@@ -449,7 +501,7 @@ void loop()
         if (blinkToggleCount < 0 && blinkPeriod == BLINK_PERIOD_FAST
             && ((!dimUp && settings.brightness == BRIGHTNESS_MIN) || (dimUp && settings.brightness == BRIGHTNESS_MAX)))
         {
-          // continued proxymity after blinking at top/bottom
+          // continued proximity after blinking at top/bottom
           if (duration >= DURATION_TOGGLE_STEP)
           {
             // toggle step size and signal mode change (3 slow blinks)
@@ -564,24 +616,25 @@ void loop()
     if (blinkToggleCount <= 0)
     {
       // not blinking
-      if (ntcTemperature < NTC_TEMPERATURE_MAX)
-      {
-        // regular operation
-        dutyCycle = settings.brightness;
-      }
-      else
+      if (overTemperature)
       {
         // over temperature, reduce brightness to min value
         dutyCycle = BRIGHTNESS_MIN;
       }
+      else
+      {
+        // regular operation
+        dutyCycle = settings.brightness;
+      }
     }
+  }
 
-    // update duty cylce of PWM timer 1
-    #ifndef DEBUG
-      sbi(DDRB, DDB1); // enable OC1A output
-    #endif
+  if (dutyCycle > 0)
+  {
+    // update duty cycle of PWM timer 1
+    sbi(DDRB, DDB1); // enable OC1A output
     sbi(DDRB, DDB2); // enable OC1B output
-    OCR1A = (100 - dutyCycle)*ICR1/100;
+    OCR1A = dutyCycle*ICR1/100;
     OCR1B = OCR1A;
   }
   else
@@ -602,6 +655,10 @@ void loop()
   printDebug(blinkToggleCount);
   printDebug(" duty:");
   printDebug(dutyCycle);
+  printDebug(" startup proximity:");
+  printDebug(proximityAtStartup);
+  printDebug(" on:");
+  printDebug(outputEnabled);
   printlnDebug();
   */
 
