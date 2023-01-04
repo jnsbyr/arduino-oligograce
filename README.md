@@ -33,8 +33,7 @@ Technical notes:
   1/3 of this alone is caused by the current through Q4 on the bottom panel to keep
   the LED driver disabled when switched of via the proximity sensor.
 - Oligo uses a PWM frequency of approximately 31 kHz. If you use lower frequencies
-  around 5 kHz you will probably be able to "hear" your LEDs. The custom firmware
-  uses 40 kHz.
+  around 5 kHz you will probably be able to "hear" your LEDs.
 - The brightness settings backup failure mentioned above was probably caused by
   writing to often to the same EEPROM address. The custom firmware uses a delayed
   backup strategy to avoid writing every user setting change to EEPROM. Manually

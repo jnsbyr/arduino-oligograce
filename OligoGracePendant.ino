@@ -39,10 +39,11 @@
  *   - dim limit reached: 2 short blinks
  *   - dim hold > 5 s: toggle dim mode continuous/3 steps (3 longs blinks)
  *   - limit brightness to minimum when board temperature exceeds 85 °C and
- *     resumes normal operation after 5°C cool down
+ *     resumes normal operation after 5°C cool down (5 short blinks)
  *
  * - additional features:
  *   - hold > 15s at power up: toggle proximity sensor lock (3 longs blinks)
+ *   - fade on/off
  *
  * ****************************************************************************
  *
@@ -96,15 +97,13 @@
  *****************************************************************************
  *
  * possible additional features:
- * - fade on/off
  * - separate setting for top and bottom panel
- * - 5 short blinks when board over temperature is detected for the 1st time
  * - sync setting of 2 pendants
  * - change setting over air (WiFi/Bluetooth)
  *
  *****************************************************************************/
 
-#define VERSION "1.0.1.0" // 03.01.2023
+#define VERSION "1.0.2.0" // 03.01.2023
 
 // Arduino includes, LGPL license
 #include <EEPROM.h>
@@ -117,7 +116,7 @@
 #include <avr/wdt.h>
 #include <util/crc16.h>
 
-//#define DEBUG // comment in if serial debugging is needed, will also disables bottom panel
+//#define DEBUG // @todo: comment in if serial debugging is needed, will also disables bottom panel
 #ifdef DEBUG
   #define printDebug(x) Serial.print(x)
   #define printlnDebug(x) Serial.println(x)
@@ -159,7 +158,7 @@
 #define BRIGHTNESS_DEFAULT    (BRIGHTNESS_MAX - BRIGHTNESS_STEP_BIG) // [%], step 2/3
 
 // blink timing
-#define BLINK_PERIOD_FAST  50 // [ms]
+#define BLINK_PERIOD_FAST  60 // [ms]
 #define BLINK_PERIOD_SLOW 800 // [ms]
 
 // board temperature parameters
@@ -187,6 +186,7 @@ Settings settings;
 // ISR variables
 volatile int near = false;
 volatile int blinkToggleCount = 0;
+volatile int fadeOCR = -1;
 volatile unsigned long approach = 0;
 volatile bool initalApproach = false;
 volatile bool outputEnabled = false;
@@ -205,8 +205,9 @@ int adcResolution = 0;
 enum Mode
 {
   MODE_DEFAULT,
-  MODE_BLINK_SLOW,
-  MODE_BLINK_FAST,
+  MODE_BLINK_SETTINGS,
+  MODE_BLINK_LIMIT,
+  MODE_BLINK_WARNING,
   MODE_BLINK_END
 };
 
@@ -218,15 +219,21 @@ void setMode(Mode mode)
       blinkToggleCount = 0;
       break;
 
-    case MODE_BLINK_FAST:
+    case MODE_BLINK_LIMIT:
       blinkToggleCount = 4;
       blinkPeriod = BLINK_PERIOD_FAST;
       blinkToggled = 0;
       break;
 
-    case MODE_BLINK_SLOW:
+    case MODE_BLINK_SETTINGS:
       blinkToggleCount = 6;
       blinkPeriod = BLINK_PERIOD_SLOW;
+      blinkToggled = 0;
+      break;
+
+    case MODE_BLINK_WARNING:
+      blinkToggleCount = 10;
+      blinkPeriod = BLINK_PERIOD_FAST;
       blinkToggled = 0;
       break;
 
@@ -250,6 +257,15 @@ template<typename T> uint16_t calculateCRC16(T& t)
   }
 
   return crc16;
+}
+
+/**
+ * @param brightness [%]
+ * @return duty cycle value for timer 1 OCR register
+ */
+inline uint16_t brightnessToOCR(int brightness)
+{
+  return brightness>=0? brightness<=100? brightness*ICR1/100 : 100 : 0;
 }
 
 /**
@@ -332,8 +348,41 @@ void proximity()
         {
           // was off, set default mode
           setMode(MODE_DEFAULT);
+          fadeOCR = brightnessToOCR(settings.brightness);
         }
       }
+    }
+  }
+
+  interrupts();
+}
+
+/**
+ * ISR for fader timer 2 (15 ms)
+ */
+ISR(TIMER2_COMPA_vect)
+{
+  noInterrupts();
+
+  if (fadeOCR >= 0)
+  {
+    if (OCR1A < fadeOCR)
+    {
+      // increase duty cycle to max.
+      ++OCR1A;
+      OCR1B = OCR1A;
+    }
+    else if (OCR1A > fadeOCR)
+    {
+      // decrease duty cyle to zero
+      --OCR1A;
+      OCR1B = OCR1A;
+    }
+
+    if (OCR1A == fadeOCR)
+    {
+      // fading completed
+      fadeOCR = -1;
     }
   }
 
@@ -345,7 +394,7 @@ void proximity()
  */
 void setup()
 {
-  // @todo change I/O clock to 4 MHz (8 MHz / 2): reduces PWM duty cycle resolution and messes with millis()
+  // maybe change I/O clock to 4 MHz (8 MHz / 2), but it will also reduce PWM duty cycle resolution
   //noInterrupts();
   //CLKPR = _BV(CLKPCE);
   //CLKPR = _BV(CLKPS0);
@@ -368,11 +417,20 @@ void setup()
   TCCR1A = 0;
   TCCR1B = 0;
   TCNT1 = 0;
-  ICR1 = F_CPU/40000; // 40 kHz PWM (so that you can't hear the LEDs)
+  ICR1 = F_CPU/32000; // 32 kHz PWM (so that you can't hear the LEDs)
   OCR1A = 0;
   OCR1B = 0;
   TCCR1A = _BV(COM1A1) | _BV(COM1A0) |_BV(COM1B1) |_BV(COM1B0) | _BV(WGM11); // set output on match (inverted)
-  TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10); // fast PWM with TOP=ICR1 (mode 14)
+  TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10); // fast PWM with TOP=ICR1 (mode 14), clock not prescaled
+
+  // configure LED brightness fader (via timer 2)
+  TCCR2A = 0;
+  TCCR2B = 0;
+  TCNT2 = 0;
+  OCR2A = (1*F_CPU)/(1024L*ICR1); // 1 s for 100 % of timer 1 duty cycle steps
+  TCCR2A = _BV(WGM21); // CTC with TOP=OCR2A (mode 2)
+  TCCR2B = _BV(CS22) | _BV(CS21) | _BV(CS20); // clock prescaled by 1024
+  sbi(TIMSK2, OCIE2A); // enable timer 2 interrupt
 
   // configure ADC
   analogReference(DEFAULT); // ATmega328: via AVCC pin
@@ -405,8 +463,9 @@ void setup()
     }
   }
 
-  // turn output on at power up, prefer dim up
+  // turn output on at power up, prefer initial dim up
   outputEnabled = true;
+  fadeOCR = brightnessToOCR(settings.brightness);
   dimUp = settings.brightness == BRIGHTNESS_MIN? false : true;
   if (settings.brightness == BRIGHTNESS_MIN || settings.brightness == BRIGHTNESS_MAX)
   {
@@ -455,21 +514,23 @@ void loop()
 
   // check board temperature
   int ntcTemperature = getNtcTemperature();
-  if (ntcTemperature >= NTC_TEMP_MAX)
-  {
-    overTemperature = true;
-  }
-  else if (ntcTemperature < NTC_TEMP_MAX - NTC_TEMP_HYSTERESIS)
-  {
-    overTemperature = false;
-  }
 
   /* extra debug
   printDebug("temp:");
   printlnDebug(ntcTemperature);
   */
 
-  // test: overTemperature = false;
+  //ntcTemperature = 30; // @todo: comment in for testing without NTC
+
+  if (!overTemperature && ntcTemperature >= NTC_TEMP_MAX)
+  {
+    overTemperature = true;
+    setMode(MODE_BLINK_WARNING);
+  }
+  else if (overTemperature && ntcTemperature <= NTC_TEMP_MAX - NTC_TEMP_HYSTERESIS)
+  {
+    overTemperature = false;
+  }
 
   // check proximity to dim brightness and to toggle dim direction
   unsigned int now = millis();
@@ -486,7 +547,7 @@ void loop()
           settings.proximitySensorLocked = !settings.proximitySensorLocked;
           settingsModified = now;
           proximityAtStartup = false;
-          setMode(MODE_BLINK_SLOW);
+          setMode(MODE_BLINK_SETTINGS);
         }
       }
       else if (initalApproach)
@@ -507,7 +568,7 @@ void loop()
             // toggle step size and signal mode change (3 slow blinks)
             settings.dimBigSteps = !settings.dimBigSteps;
             settingsModified = now;
-            setMode(MODE_BLINK_SLOW);
+            setMode(MODE_BLINK_SETTINGS);
           }
         }
       }
@@ -536,7 +597,7 @@ void loop()
             if (settings.brightness >= BRIGHTNESS_MAX)
             {
               // new at limit, signal
-              setMode(MODE_BLINK_FAST);
+              setMode(MODE_BLINK_LIMIT);
             }
           }
           else
@@ -556,7 +617,7 @@ void loop()
             if (settings.brightness <= BRIGHTNESS_MIN)
             {
               // new at limit, signal
-              setMode(MODE_BLINK_FAST);
+              setMode(MODE_BLINK_LIMIT);
             }
           }
           else
@@ -574,7 +635,7 @@ void loop()
   }
 
   // control output (on, off, brightness)
-  int dutyCycle = 0;
+  int brightness = 0;
   if (outputEnabled)
   {
     if (blinkToggleCount > 0)
@@ -610,7 +671,7 @@ void loop()
           initalApproach = false;
         }
       }
-      dutyCycle = blinkBrightness;
+      brightness = blinkBrightness;
     }
 
     if (blinkToggleCount <= 0)
@@ -619,29 +680,39 @@ void loop()
       if (overTemperature)
       {
         // over temperature, reduce brightness to min value
-        dutyCycle = BRIGHTNESS_MIN;
+        brightness = BRIGHTNESS_MIN;
       }
       else
       {
         // regular operation
-        dutyCycle = settings.brightness;
+        brightness = settings.brightness;
       }
     }
   }
+  else
+  {
+    // output disabled, fade out
+    fadeOCR = 0;
+  }
 
-  if (dutyCycle > 0)
+  if (brightness > 0)
   {
     // update duty cycle of PWM timer 1
     sbi(DDRB, DDB1); // enable OC1A output
     sbi(DDRB, DDB2); // enable OC1B output
-    OCR1A = dutyCycle*ICR1/100;
-    OCR1B = OCR1A;
+    if (fadeOCR < 0)
+    {
+      OCR1A = brightnessToOCR(brightness);
+      OCR1B = OCR1A;
+    }
   }
-  else
+  else if (fadeOCR < 0)
   {
     // disable outputs
     cbi(DDRB, DDB1); // disable OC1A output
     cbi(DDRB, DDB2); // disable OC1B output
+    OCR1A = 0;
+    OCR1B = OCR1A;
   }
 
   /* extra debug
@@ -654,7 +725,7 @@ void loop()
   printDebug(" blink:");
   printDebug(blinkToggleCount);
   printDebug(" duty:");
-  printDebug(dutyCycle);
+  printDebug(brightness);
   printDebug(" startup proximity:");
   printDebug(proximityAtStartup);
   printDebug(" on:");
