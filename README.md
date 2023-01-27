@@ -87,13 +87,13 @@ It is probably not worth to go to such lengths to fix this problem. Using the Ol
 
 In most of my projects I put part of the focus on the power consumption. With a LED luminaire you already save a lot of power if it is a replacement for an Edison light bulb. Nonetheless I wanted to know how much power the Oligo pendant needs and if the power consumption can be reduced any further. A measurement in brightness step mode yields the following results:
 
-  mode             | current [mA] @ 24 V DC | power [W] 
- ----------------: | ---------------------: | --------: 
-           standby |                     25 |       0.6 
-  3.5 % brightness |                     46 |       1.1 
- 16.5 % brightness |                    127 |       3.0 
- 31.9 % brightness |                    225 |       5.4 
-                on |                    638 |      15.3 
+|  mode             | current [mA] @ 24 V DC | power [W] |
+| ----------------: | ---------------------: | --------: |
+|           standby |                     25 |       0.6 |
+|  3.5 % brightness |                     46 |       1.1 |
+| 16.5 % brightness |                    127 |       3.0 |
+| 31.9 % brightness |                    225 |       5.4 |
+|                on |                    638 |      15.3 |
 
 Maximum power consumption is 15.3 W per pendant. Saving power when the luminaire is switched on is trivial by reducing the brightness to the level you need.
 
@@ -105,13 +105,13 @@ My tests with an Arduino Nano 16 MHz board at 5 V show that the standby current 
 
 A measurement with the custom firmware (version 1.0.4.0) in brightness step mode proofed this to be true. The supply current reduction (idle vs. delay) in standby mode is ~4 mA and at power on ~2 mA. This is not much by absolute standards at less than 1 kWh/year, but the relative effect from the ATmega328P perspective is still high with ~50 % and ~25 % power reduction respectively considering that an ATmega328P by itself uses ~8 mA at 8 MHz.
 
-  mode             | current [mA] @ 24 V DC | power [W] 
- ----------------: | ---------------------: | --------: 
-           standby |                26 → 22 |       0.5 
-  4.0 % brightness |                52 → 52 |       1.2 
- 16.0 % brightness |              128 → 127 |       3.0 
- 32.0 % brightness |              229 → 227 |       5.5 
-                on |              641 → 638 |      15.3 
+|   mode            | current [mA] @ 24 V DC | power [W] |
+| ----------------: | ---------------------: | --------: |
+|           standby |                26 → 22 |       0.5 |
+|  4.0 % brightness |                52 → 52 |       1.2 |
+| 16.0 % brightness |              128 → 127 |       3.0 |
+| 32.0 % brightness |              229 → 227 |       5.5 |
+|                on |              641 → 638 |      15.3 |
 
 Note that the power consumptions listed above do not include the mains power adapter. One can expect that the total power consumption of a pendant duo with power adapter is slightly higher by at least 1 W / 80 %, making it around 2 W for standby and around 36 W when on.
 
