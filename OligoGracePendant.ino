@@ -39,17 +39,19 @@
  *   - proximity > 800 ms: dim up/down
  *   - dim limit reached: 2 short blinks
  *   - dim hold > 5 s: toggle dim mode continuous/3 steps (3 longs blinks)
- *   - limit brightness to minimum when board temperature exceeds 85 °C and
- *     resume normal operation after 5°C cool down (5 short blinks)
+ *   - limit brightness to minimum when board temperature exceeds 85 °C
+ *     (5 short blinks) and resume normal operation after 5°C cool down
  *
  * - additional features:
- *   - hold > 15s at power up: toggle proximity sensor lock (3 longs blinks)
+ *   - hold > 15 s at power up: toggle proximity sensor lock (3 longs blinks)
+ *   - reduced standby and power on consumption
  *
  * ****************************************************************************
  *
- * Oligo Grace MCU: ATmega328P - 5V
+ * Oligo Grace Board:
  *
- * - standby power consumption per pendant: 0.6 W (24 V, 26 mA)
+ * - MCU: ATmega328P - 5V
+ * - standby power consumption per pendant: 0.6 W (24 V, 25 mA, original firmware)
  * - power on current per pendant: ~0.8 A
  * - power on consumption per pendant: 1.5 W ... 15.5 W
  *
@@ -112,7 +114,7 @@
  *
  *****************************************************************************/
 
-#define VERSION "1.0.3.0" // 06.01.2023
+#define VERSION "1.0.4.0" // 14.01.2023
 
 // Arduino includes, LGPL license
 #include <EEPROM.h>
@@ -121,11 +123,15 @@
 
 // AVR includes, modified BSD license
 #include <avr/io.h>
+#include <avr/power.h>
 #include <avr/sfr_defs.h>
+#include <avr/sleep.h>
 #include <avr/wdt.h>
 #include <util/crc16.h>
 
+//#define TEST  // @todo: comment in for testing without NTC
 //#define DEBUG // @todo: comment in if serial debugging is needed, will also disables bottom panel
+
 #ifdef DEBUG
   #define printDebug(x) Serial.print(x)
   #define printlnDebug(x) Serial.println(x)
@@ -148,6 +154,9 @@
 #define EEPROM_MAGIC   0xAFFE
 
 #define BACKUP_DELAY   10000 // [ms]
+
+// main loop
+#define LOOP_PERIOD 10 // [ms]
 
 // proximity gesture timing
 #define DURATION_MIN           100 // [ms] min. duration for proximity
@@ -190,6 +199,7 @@
 // operating modes
 enum OperationMode
 {
+  MODE_STANDBY,
   MODE_DEFAULT,
   MODE_BLINK_SETTINGS,
   MODE_BLINK_LIMIT,
@@ -234,6 +244,7 @@ unsigned int blinkPeriod = 0;
 unsigned int adcResolution = 0;
 unsigned long settingsModified = 0;
 unsigned long blinkToggled = 0;
+unsigned long delayUntil = 0;
 
 
 /**
@@ -244,6 +255,11 @@ void setOperationMode(OperationMode mode)
   operationMode = mode;
   switch (mode)
   {
+    case MODE_STANDBY:
+      blinkToggleCount = 0;
+      fadeOCR = 0;
+      break;
+
     case MODE_DEFAULT:
       blinkToggleCount = 0;
       break;
@@ -358,12 +374,12 @@ inline uint16_t brightnessToOCR(int brightness)
 int getNtcTemperature()
 {
   // sample input 3 times
-  size_t count = 3; // will take less than 750 µs
+  size_t count = 3; // ~ 19 µs (1 ADC conversion takes less than 6.25 µs at 8 MHz)
   unsigned long sum = 0;
   for (size_t i=0; i<count; i++)
   {
     sum += analogRead(PIN_NTC);
-    delay(1);
+    delayMicroseconds(20);
   }
 
   // calculate temperature
@@ -421,8 +437,9 @@ void proximity()
     }
     else
     {
-      unsigned int duration = now - approach;
-      if (initalApproach && duration >= DURATION_MIN && duration <= DURATION_POWER_MAX)
+      // proximity end
+      unsigned int proximityDuration = now - approach;
+      if (initalApproach && proximityDuration >= DURATION_MIN && proximityDuration <= DURATION_POWER_MAX)
       {
         // short proximity pulse: toggle power
         outputEnabled = !outputEnabled;
@@ -435,7 +452,7 @@ void proximity()
         else
         {
           // was on, fade off
-          fadeOCR = 0;
+          setOperationMode(MODE_STANDBY);
         }
       }
     }
@@ -493,6 +510,15 @@ void setup()
     delay(4000);
     printlnDebug("init ...");
   #endif
+
+  // permanent power saving
+  noInterrupts();
+#ifndef DEBUG
+  power_usart0_disable();
+#endif
+  power_spi_disable();
+  power_twi_disable();
+  interrupts();
 
   // configure proximity sensor input
   pinMode(PIN_PROXIMITY, INPUT);
@@ -583,241 +609,269 @@ void loop()
   // feed watchdog
   wdt_reset();
 
-  delay(9);
-
-  // check board temperature
-  int ntcTemperature = getNtcTemperature();
-
-  /* extra debug
-  printDebug("temp:");
-  printlnDebug(ntcTemperature);
-  */
-
-  ntcTemperature = 30; // @todo: comment in for testing without NTC
-
-  if (!overTemperature && ntcTemperature >= NTC_TEMP_MAX)
-  {
-    overTemperature = true;
-    setOperationMode(MODE_BLINK_WARNING);
-  }
-  else if (overTemperature && ntcTemperature <= NTC_TEMP_MAX - NTC_TEMP_HYSTERESIS)
-  {
-    overTemperature = false;
-  }
-
   // check proximity to dim brightness and to toggle dim direction
+  int brightness = 0;
   unsigned long now = millis();
-  if (outputEnabled && near)
+  unsigned int proximityDuration = now - approach;
+  bool delaying = delayUntil && now < delayUntil && (delayUntil - now) <= LOOP_PERIOD;
+  if (!delaying)
   {
-    unsigned int duration = now - approach;
-    if (duration >= DURATION_DIM_MIN)
+    if (outputEnabled && near)
     {
-      if (proximityAtStartup)
+      if (proximityDuration >= DURATION_DIM_MIN)
       {
-        if (duration >= DURATION_LOCK)
+        if (proximityAtStartup)
         {
-          // startup proximity, toggle proximity sensor lock
-          settings.proximitySensorLocked = !settings.proximitySensorLocked;
-          settingsModified = now;
-          proximityAtStartup = false;
-          setOperationMode(MODE_BLINK_SETTINGS);
-        }
-      }
-      else if (initalApproach)
-      {
-        // inital proximity, change dimmer direction
-        dimUp = !dimUp;
-        initalApproach = false;
-      }
-      else
-      {
-        // dimmer step size selection
-        if (operationMode == MODE_BLINK_END && blinkPeriod == BLINK_PERIOD_FAST
-            && ((!dimUp && settings.brightness == BRIGHTNESS_MIN) || (dimUp && settings.brightness == BRIGHTNESS_MAX)))
-        {
-          // continued proximity after blinking at top/bottom
-          if (duration >= DURATION_TOGGLE_STEP)
+          if (proximityDuration >= DURATION_LOCK)
           {
-            // toggle step size and signal mode change (3 slow blinks)
-            settings.dimSteps = !settings.dimSteps;
+            // startup proximity, toggle proximity sensor lock
+            settings.proximitySensorLocked = !settings.proximitySensorLocked;
             settingsModified = now;
+            proximityAtStartup = false;
             setOperationMode(MODE_BLINK_SETTINGS);
           }
         }
-      }
-
-      // change brightness
-      bool changeBrightness = operationMode == MODE_DEFAULT;
-      if (changeBrightness)
-      {
-        // init dim behaviour
-        int dimDelay = settings.dimSteps? DURATION_DIM_STEP : DURATION_DIM_INC;
-        BrightnessLevel brightnessLevel = getBrightnessLevel();
-        if (dimUp)
+        else if (initalApproach)
         {
-          // dim up
-          if (settings.brightness < BRIGHTNESS_MAX)
-          {
-            if (settings.dimSteps)
-            {
-              settings.brightness = ++brightnessLevel;
-            }
-            else
-            {
-              settings.brightness = min(settings.brightness + BRIGHTNESS_INC, BRIGHTNESS_MAX);
-            }
-            settingsModified = now;
-
-            if (settings.brightness >= BRIGHTNESS_MAX)
-            {
-              // new at limit, signal
-              setOperationMode(MODE_BLINK_LIMIT);
-            }
-          }
-          else
-          {
-            // limit value
-            settings.brightness = BRIGHTNESS_MAX;
-          }
+          // inital proximity, change dimmer direction
+          dimUp = !dimUp;
+          initalApproach = false;
         }
         else
         {
-          // dim down
-          if (settings.brightness > BRIGHTNESS_MIN)
+          // dimmer step size selection
+          if (operationMode == MODE_BLINK_END && blinkPeriod == BLINK_PERIOD_FAST
+              && ((!dimUp && settings.brightness == BRIGHTNESS_MIN) || (dimUp && settings.brightness == BRIGHTNESS_MAX)))
           {
-            if (settings.dimSteps)
+            // continued proximity after blinking at top/bottom
+            if (proximityDuration >= DURATION_TOGGLE_STEP)
             {
-              settings.brightness = --brightnessLevel;
-            }
-            else
-            {
-              settings.brightness = max(settings.brightness - BRIGHTNESS_INC, BRIGHTNESS_MIN);
-            }
-            settingsModified = now;
-
-            if (settings.brightness <= BRIGHTNESS_MIN)
-            {
-              // new at limit, signal
-              setOperationMode(MODE_BLINK_LIMIT);
+              // toggle step size and signal mode change (3 slow blinks)
+              settings.dimSteps = !settings.dimSteps;
+              settingsModified = now;
+              setOperationMode(MODE_BLINK_SETTINGS);
             }
           }
-          else
-          {
-            // limit value
-            settings.brightness = BRIGHTNESS_MIN;
-          }
         }
-        printlnDebug(settings.brightness);
 
-        // modify approach start time for periodic repeat
-        approach += dimDelay;
-        initalApproach = false;
-      }
-    }
-  }
-
-  // control output (on, off, brightness)
-  int brightness = 0;
-  if (outputEnabled)
-  {
-    if (blinkToggleCount > 0)
-    {
-      // blinking
-      unsigned int period = blinkPeriod;
-      if (!blinkToggled || (now - blinkToggled) >= period)
-      {
-        // toggle blink brightness
-        --blinkToggleCount;
-        blinkToggled = now;
-        if (blinkToggleCount%2 == 0)
+        // change brightness
+        bool changeBrightness = operationMode == MODE_DEFAULT;
+        if (changeBrightness)
         {
-          // end of blink: restore brightness
-          blinkBrightness = settings.brightness;
-        }
-        else
-        {
-          // new blink: preferably with lowered brightness
+          // init dim behaviour
+          int dimDelay = settings.dimSteps? DURATION_DIM_STEP : DURATION_DIM_INC;
           BrightnessLevel brightnessLevel = getBrightnessLevel();
-          blinkBrightness = brightnessLevel > LEVEL_0? --brightnessLevel : ++brightnessLevel;
-        }
-        if (blinkToggleCount == 0)
-        {
-          // blinking completed, block further brightness changes during current proximity
-          setOperationMode(MODE_BLINK_END);
-          approach = now;
+          if (dimUp)
+          {
+            // dim up
+            if (settings.brightness < BRIGHTNESS_MAX)
+            {
+              if (settings.dimSteps)
+              {
+                settings.brightness = ++brightnessLevel;
+              }
+              else
+              {
+                settings.brightness = min(settings.brightness + BRIGHTNESS_INC, BRIGHTNESS_MAX);
+              }
+              settingsModified = now;
+
+              if (settings.brightness >= BRIGHTNESS_MAX)
+              {
+                // new at limit, signal
+                setOperationMode(MODE_BLINK_LIMIT);
+              }
+            }
+            else
+            {
+              // limit value
+              settings.brightness = BRIGHTNESS_MAX;
+            }
+          }
+          else
+          {
+            // dim down
+            if (settings.brightness > BRIGHTNESS_MIN)
+            {
+              if (settings.dimSteps)
+              {
+                settings.brightness = --brightnessLevel;
+              }
+              else
+              {
+                settings.brightness = max(settings.brightness - BRIGHTNESS_INC, BRIGHTNESS_MIN);
+              }
+              settingsModified = now;
+
+              if (settings.brightness <= BRIGHTNESS_MIN)
+              {
+                // new at limit, signal
+                setOperationMode(MODE_BLINK_LIMIT);
+              }
+            }
+            else
+            {
+              // limit value
+              settings.brightness = BRIGHTNESS_MIN;
+            }
+          }
+          printlnDebug(settings.brightness);
+
+          // modify approach start time for periodic repeat
+          approach += dimDelay;
           initalApproach = false;
         }
       }
-      brightness = blinkBrightness;
     }
 
-    if (blinkToggleCount <= 0)
+    // control output (on, off, brightness)
+    if (outputEnabled)
     {
-      // not blinking
-      if (overTemperature)
+      if (blinkToggleCount > 0)
       {
-        // over temperature, reduce brightness to min value
-        brightness = BRIGHTNESS_MIN;
+        // blinking
+        unsigned int period = blinkPeriod;
+        if (!blinkToggled || (now - blinkToggled) >= period)
+        {
+          // toggle blink brightness
+          --blinkToggleCount;
+          blinkToggled = now;
+          if (blinkToggleCount%2 == 0)
+          {
+            // end of blink: restore brightness
+            blinkBrightness = settings.brightness;
+          }
+          else
+          {
+            // new blink: preferably with lowered brightness
+            BrightnessLevel brightnessLevel = getBrightnessLevel();
+            blinkBrightness = brightnessLevel > LEVEL_0? --brightnessLevel : ++brightnessLevel;
+          }
+          if (blinkToggleCount == 0)
+          {
+            // blinking completed, block further brightness changes during current proximity
+            setOperationMode(MODE_BLINK_END);
+            approach = now;
+            initalApproach = false;
+          }
+        }
+        brightness = blinkBrightness;
       }
-      else
+
+      // check board temperature
+      int ntcTemperature;
+      power_adc_enable();
+      #ifndef TEST
+        ntcTemperature = getNtcTemperature();
+        printDebug("temp:");
+        printDebug(ntcTemperature);
+      #else
+        getNtcTemperature();
+        ntcTemperature = 30;
+      #endif
+      if (!overTemperature && ntcTemperature >= NTC_TEMP_MAX)
       {
-        // regular operation
-        brightness = settings.brightness;
+        overTemperature = true;
+        setOperationMode(MODE_BLINK_WARNING);
+      }
+      else if (overTemperature && ntcTemperature <= NTC_TEMP_MAX - NTC_TEMP_HYSTERESIS)
+      {
+        overTemperature = false;
+      }
+
+      if (blinkToggleCount <= 0)
+      {
+        // not blinking
+        if (overTemperature)
+        {
+          // over temperature, reduce brightness to min value
+          brightness = BRIGHTNESS_MIN;
+        }
+        else
+        {
+          // regular operation
+          brightness = settings.brightness;
+        }
       }
     }
-  }
 
-  if (brightness > 0)
-  {
-    // update duty cycle of PWM timer 1
-    sbi(DDRB, DDB1); // enable OC1A output
-    sbi(DDRB, DDB2); // enable OC1B output
-    if (fadeOCR < 0)
+    if (brightness > 0)
     {
-      OCR1A = brightnessToOCR(brightness);
+      // update duty cycle of PWM timer 1
+      sbi(DDRB, DDB1); // enable OC1A output
+      sbi(DDRB, DDB2); // enable OC1B output
+      if (fadeOCR < 0)
+      {
+        OCR1A = brightnessToOCR(brightness);
+        OCR1B = OCR1A;
+      }
+    }
+    else if (fadeOCR < 0)
+    {
+      // disable outputs
+      cbi(DDRB, DDB1); // disable OC1A output
+      cbi(DDRB, DDB2); // disable OC1B output
+      OCR1A = 0;
       OCR1B = OCR1A;
     }
-  }
-  else if (fadeOCR < 0)
-  {
-    // disable outputs
-    cbi(DDRB, DDB1); // disable OC1A output
-    cbi(DDRB, DDB2); // disable OC1B output
-    OCR1A = 0;
-    OCR1B = OCR1A;
+
+    // debug
+    printDebug("near:");
+    printDebug(near);
+    printDebug(" initial:");
+    printDebug(initalApproach);
+    printDebug(" up:");
+    printDebug(dimUp);
+    printDebug(" step:");
+    printDebug(settings.dimSteps);
+    printDebug(" bright:");
+    printDebug(settings.brightness);
+    printDebug(" blink:");
+    printDebug(blinkToggleCount);
+    printDebug(" duty:");
+    printDebug(brightness);
+    printDebug(" startup proximity:");
+    printDebug(proximityAtStartup);
+    printDebug(" on:");
+    printDebug(outputEnabled);
+    printDebug(" fade:");
+    printDebug(fadeOCR);
+    printlnDebug();
+
+    // backup settings
+    if (settingsModified && (now - settingsModified) >= BACKUP_DELAY)
+    {
+      // backup delay reached, save settings
+      settings.crc = 0;
+      settings.crc = calculateCRC16(settings);
+      EEPROM.put(EEPROM_ADDRESS, settings);
+      settingsModified = 0;
+      printlnDebug("settings saved to EEPROM");
+    }
   }
 
-  // debug
-  printDebug("near:");
-  printDebug(near);
-  printDebug(" initial:");
-  printDebug(initalApproach);
-  printDebug(" up:");
-  printDebug(dimUp);
-  printDebug(" step:");
-  printDebug(settings.dimSteps);
-  printDebug(" bright:");
-  printDebug(settings.brightness);
-  printDebug(" blink:");
-  printDebug(blinkToggleCount);
-  printDebug(" duty:");
-  printDebug(brightness);
-  printDebug(" startup proximity:");
-  printDebug(proximityAtStartup);
-  printDebug(" on:");
-  printDebug(outputEnabled);
-  printDebug(" fade:");
-  printDebug(fadeOCR);
-  printlnDebug();
-
-  // backup settings
-  if (settingsModified && (now - settingsModified) >= BACKUP_DELAY)
+  // dynamic power saving
+  if (delaying)
   {
-    // backup delay reached, save settings
-    settings.crc = 0;
-    settings.crc = calculateCRC16(settings);
-    EEPROM.put(EEPROM_ADDRESS, settings);
-    settingsModified = 0;
-    printlnDebug("settings saved to EEPROM");
+    // delaying, stay idle until next interrupt (timer, proximity)
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    sleep_mode();
+  }
+  else if (operationMode == MODE_STANDBY && fadeOCR < 0 && !(initalApproach && proximityDuration <= DURATION_POWER_MAX))
+  {
+    // LED is off, power down until next interrupt (proximity), disable ADC and watchdog
+    delayUntil = 0;
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    wdt_disable();
+    power_adc_disable();
+    sleep_mode();
+    wdt_enable(WDTO_2S);
+  }
+  else
+  {
+    // was active, stay idle until next interrupt (timer, proximity) and start passive delay
+    delayUntil = now + LOOP_PERIOD;
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    sleep_mode();
   }
 }
