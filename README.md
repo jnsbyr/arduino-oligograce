@@ -68,7 +68,7 @@ Next you should test if the wiring between the ISP and the Oligo board is good b
 
 Example:
 
-    C:\Users\Username\AppData\Local\Arduino15\packages\arduino\tools\avrdude\6.3.0-arduino17/bin/avrdude -C C:\Users\Username\AppData\Local\Arduino15\packages\arduino\tools\avrdude\6.3.0-arduino17/etc/avrdude.conf -v -V -p atmega328p -c stk500v1 -P COM3 -b 19200 -D -U signature:r:-:i
+    C:\Users\<username>\AppData\Local\Arduino15\packages\arduino\tools\avrdude\6.3.0-arduino17/bin/avrdude -C C:\Users\<username>\AppData\Local\Arduino15\packages\arduino\tools\avrdude\6.3.0-arduino17/etc/avrdude.conf -v -V -p atmega328p -c stk500v1 -P COM3 -b 19200 -D -U signature:r:-:i
 
 This command should output the MCU signature confirming you have found a ATmega328 on the Oligo board and the current setting of the fuses. Compare the fuse values with the values documented at the top of the INO file.
 
@@ -78,7 +78,7 @@ This command should output the MCU signature confirming you have found a ATmega3
   I do not provide any warranty and I will not assume any responsibility for any
   damage you cause yourself or others by using this project.
 
-After a successful upload of the custom firmware you should not notice significant functional differences but it should fix the brightness settings memory.
+After a successful upload of the custom firmware you should not notice significant functional differences, but it should fix the brightness settings memory.
 
 It is probably not worth to go to such lengths to fix this problem. Using the Oligo repair service is the easiest way for most. This project just gives you another option.
 
@@ -114,6 +114,15 @@ A measurement with the custom firmware (version 1.0.4.0) in brightness step mode
 |                on |              641 → 638 |      15.3 |
 
 Note that the power consumptions listed above do not include the mains power adapter. One can expect that the total power consumption of a pendant duo with power adapter is slightly higher by at least 1 W / 80 %, making it around 2 W for standby and around 36 W when on.
+
+
+## Known Problems
+
+After about 10 months with the custom firmware both pendants switched to full brightness within the same minute and they did not react to the proximity sensor any more. The 8 MHz CPU clock was still running (L fuse: 0xA2, pin A1), but that was all I was able to diagnose from the outside. After reflashing the firmware the pendant reacted to the proximity sensor again, but in an arbitrary kind of way. Temporarily disabling the idle sleep mode restored the expected behaviour and it kept working after the sleep mode was activated again. Effectively I just flashed the firmware several times.
+
+After a code review I made some minor code modification like removing the interrupt disable/enable from the ISRs, making sure that all variables used in the ISRs are marked volatile and increased the fading duration from 500 ms to 2 s. With this modified firmware the second pendant worked immediately after reflashing only once.
+
+But if these code changes have any relation to the problem is hard to say without an in-circuit debugger. What I'm missing is a power fail detection to prevent writing to the EEPROM during that time. The ATmega328P brown out detection does not raise an interrupt but resets the MCU. This can happen in the middle of a write operation and may be unhealthy for the EEPROM data consistency. But this should not affect the flash data and the firmware uses an EEPROM checksum.
 
 
 ## Contributing
