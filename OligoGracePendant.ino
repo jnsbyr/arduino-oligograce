@@ -114,7 +114,7 @@
  *
  *****************************************************************************/
 
-#define VERSION "1.0.4.0" // 14.01.2023
+#define VERSION "1.0.4.1" // 18.11.2023
 
 // Arduino includes, LGPL license
 #include <EEPROM.h>
@@ -130,7 +130,7 @@
 #include <util/crc16.h>
 
 //#define TEST  // @todo: comment in for testing without NTC
-//#define DEBUG // @todo: comment in if serial debugging is needed, will also disables bottom panel
+//#define DEBUG // @todo: comment in if serial debugging is needed, will also disable bottom panel
 
 #ifdef DEBUG
   #define printDebug(x) Serial.print(x)
@@ -179,7 +179,7 @@
 #endif
 
 // timer parameters
-#define PWM_FREQUENCY  32000 // [Hz]  select frequency so that you can't hear the LEDs (8/16 MHz: 245 Hz ... 40 kHz)
+#define PWM_FREQUENCY  32000 // [Hz] select frequency so that you can't hear the LEDs (8/16 MHz: 245 Hz ... 40 kHz)
 #define FADE_FREQUENCY     2 // [1/s] number of times per second to change timer 1 from 0 % to 100 % duty cycle
 
 // blink timing
@@ -235,15 +235,15 @@ volatile bool proximityAtStartup = false;
 volatile int fadeOCR = -1;
 volatile unsigned long approach = 0;
 volatile OperationMode operationMode = MODE_DEFAULT;
+volatile int blinkToggleCount = 0;
+volatile unsigned int blinkPeriod = 0;
+volatile unsigned long blinkToggled = 0;
 
 bool dimUp = true;
 bool overTemperature = true;
-int blinkToggleCount = 0;
 unsigned int blinkBrightness = 0;
-unsigned int blinkPeriod = 0;
 unsigned int adcResolution = 0;
 unsigned long settingsModified = 0;
-unsigned long blinkToggled = 0;
 unsigned long delayUntil = 0;
 
 
@@ -416,8 +416,6 @@ int getNtcTemperature()
  */
 void proximity()
 {
-  noInterrupts();
-
   near = digitalRead(PIN_PROXIMITY);
 
   if (!settings.proximitySensorLocked)
@@ -457,8 +455,6 @@ void proximity()
       }
     }
   }
-
-  interrupts();
 }
 
 /**
@@ -466,8 +462,6 @@ void proximity()
  */
 ISR(TIMER2_COMPA_vect)
 {
-  noInterrupts();
-
   if (fadeOCR >= 0)
   {
     if (OCR1A < (uint16_t)fadeOCR)
@@ -489,8 +483,6 @@ ISR(TIMER2_COMPA_vect)
       fadeOCR = -1;
     }
   }
-
-  interrupts();
 }
 
 /**
@@ -530,7 +522,7 @@ void setup()
   TCCR1A = 0;
   TCCR1B = 0;
   TCNT1 = 0;
-  ICR1 = F_CPU/PWM_FREQUENCY; // PWM frequency
+  ICR1 = F_CPU/PWM_FREQUENCY; // timer ticks per PWM period (0..65535)
   OCR1A = 0;
   OCR1B = 0;
   TCCR1A = _BV(COM1A1) | _BV(COM1A0) |_BV(COM1B1) |_BV(COM1B0) | _BV(WGM11); // set output on match (inverted)
@@ -542,7 +534,7 @@ void setup()
   TCNT2 = 0;
   OCR2A = F_CPU/(1024L*ICR1)/FADE_FREQUENCY; // duration for changing timer 1 to 100 % duty cycle
   TCCR2A = _BV(WGM21); // CTC with TOP=OCR2A (mode 2)
-  TCCR2B = _BV(CS22) | _BV(CS21) | _BV(CS20); // clock prescaled by 1024
+  TCCR2B = _BV(CS22) | _BV(CS21) | _BV(CS20); // CPU clock prescaled by 1024 -> 7813 Hz
   sbi(TIMSK2, OCIE2A); // enable timer 2 interrupt
 
   // configure ADC
@@ -765,6 +757,7 @@ void loop()
         ntcTemperature = getNtcTemperature();
         printDebug("temp:");
         printDebug(ntcTemperature);
+        printDebug(" ");
       #else
         getNtcTemperature();
         ntcTemperature = 30;
@@ -853,13 +846,13 @@ void loop()
   // dynamic power saving
   if (delaying)
   {
-    // delaying, stay idle until next interrupt (timer, proximity)
+    // delaying: stay idle until next interrupt (timer, proximity)
     set_sleep_mode(SLEEP_MODE_IDLE);
     sleep_mode();
   }
   else if (operationMode == MODE_STANDBY && fadeOCR < 0 && !(initalApproach && proximityDuration <= DURATION_POWER_MAX))
   {
-    // LED is off, power down until next interrupt (proximity), disable ADC and watchdog
+    // LED is off, disable ADC and watchdog and power down until next interrupt (proximity)
     delayUntil = 0;
     set_sleep_mode(SLEEP_MODE_PWR_DOWN);
     wdt_disable();
@@ -869,7 +862,7 @@ void loop()
   }
   else
   {
-    // was active, stay idle until next interrupt (timer, proximity) and start passive delay
+    // was active, start passive delay: stay idle until next interrupt (timer, proximity)
     delayUntil = now + LOOP_PERIOD;
     set_sleep_mode(SLEEP_MODE_IDLE);
     sleep_mode();
