@@ -180,7 +180,7 @@
 
 // timer parameters
 #define PWM_FREQUENCY  32000 // [Hz] select frequency so that you can't hear the LEDs (8/16 MHz: 245 Hz ... 40 kHz)
-#define FADE_FREQUENCY     2 // [1/s] number of times per second to change timer 1 from 0 % to 100 % duty cycle
+#define FADE_DURATION      2 // [s]  number of seconds to change timer 1 from 0 % to 100 % duty cycle
 
 // blink timing
 #define BLINK_PERIOD_FAST 100 // [ms]
@@ -532,7 +532,7 @@ void setup()
   TCCR2A = 0;
   TCCR2B = 0;
   TCNT2 = 0;
-  OCR2A = F_CPU/(1024L*ICR1)/FADE_FREQUENCY; // duration for changing timer 1 to 100 % duty cycle
+  OCR2A = F_CPU/1024L*FADE_DURATION/ICR1; // timer ticks for changing timer 1 to 100 % duty cycle within fade duration
   TCCR2A = _BV(WGM21); // CTC with TOP=OCR2A (mode 2)
   TCCR2B = _BV(CS22) | _BV(CS21) | _BV(CS20); // CPU clock prescaled by 1024 -> 7813 Hz
   sbi(TIMSK2, OCIE2A); // enable timer 2 interrupt
